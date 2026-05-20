@@ -72,14 +72,14 @@ def parse_ts(ts_str):
     return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
 
 
-NODE_EXE = r"C:\Program Files\nodejs\node.exe"
+_WIN_NODE = r"C:\Program Files\nodejs\node.exe"
 
 def fetch_api_rate_limits():
     """Call rate_limit_fetcher.js to get accurate data from Anthropic API."""
     try:
-        # Use full path to node so this works when launched without a full PATH
-        # (e.g. from Windows Startup folder or Task Scheduler)
-        node = NODE_EXE if Path(NODE_EXE).exists() else "node"
+        # On Windows, prefer the full path so this works without a full PATH
+        # (e.g. from Startup folder or Task Scheduler). On macOS/Linux, use node from PATH.
+        node = _WIN_NODE if Path(_WIN_NODE).exists() else "node"
         result = subprocess.run(
             [node, str(FETCHER_JS)],
             capture_output=True, text=True, timeout=20
