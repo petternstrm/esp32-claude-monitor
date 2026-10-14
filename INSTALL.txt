@@ -1,0 +1,14 @@
+Claude Usage — Apple Silicon macOS
+
+1. Install and sign in to Claude Desktop.
+2. Drag Claude Usage.app onto Applications in this window.
+3. Open Claude Usage from Applications. Its percentage will appear in the menu bar.
+4. If macOS blocks the app, first try opening it, then go to System Settings
+   > Privacy & Security > Open Anyway and confirm Open. This is needed once
+   because the internal release is not notarized. No Terminal is required.
+5. Allow access to Claude Safe Storage if macOS asks: it enables exact
+   server-provided reset times. If declined, local usage is shown when fresh.
+
+Click the menu-bar percentage to see both limits and enable Launch at login.
+The application uses Claude Desktop's current session, without storing its
+OAuth token in a separate credential file.

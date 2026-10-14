@@ -2,10 +2,9 @@
 """
 Claude Code Usage Monitor — macOS menu bar app.
 
-Displays Claude API token usage and rate-limit reset timers in the macOS
-menu bar. Reads OAuth tokens from the Claude desktop app via Keychain,
-calls the Anthropic API every 5 minutes (~8 tokens), and scans local
-Claude Code session files for raw token counts.
+Displays Claude plan usage and reset timers in the macOS menu bar.
+Reads Claude Desktop's local usage history and optionally obtains exact
+reset times from Anthropic using the current Desktop session.
 
 Requirements:
     pip install rumps cryptography
@@ -19,36 +18,38 @@ To run at login, use a launchd plist (see README for instructions).
 import base64
 import hashlib
 import json
+import plistlib
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import rumps
+from PyObjCTools import AppHelper
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-CLIENT_ID   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-SCOPES      = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
-
-TOKEN_CACHE  = Path.home() / ".claude" / "proxy_oauth_token.json"
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CLAUDE_DIR   = Path.home() / "Library" / "Application Support" / "Claude"
-
-API_TTL   = 300  # seconds between Anthropic API calls (~8 tokens each)
-JSONL_TTL = 60   # seconds between JSONL scans
+HISTORY_FILE = CLAUDE_DIR / "plan-usage-history.json"
+LOGIN_AGENT = Path.home() / "Library" / "LaunchAgents" / "com.internal.claude-usage-monitor.plist"
+API_TTL = 300
+HISTORY_TTL = 60
+STALE_AFTER = 1800
 
 # ── macOS Keychain + token decryption ─────────────────────────────────────────
 
 def _keychain_password() -> Optional[bytes]:
     """Read the safeStorage encryption password from macOS Keychain."""
     candidates = [
-        ("Claude Safe Storage",    "Claude"),
+        ("Claude Safe Storage",    "Claude Key"),  # current Claude desktop app
+        ("Claude Safe Storage",    "Claude"),       # older Claude desktop app
         ("claude Safe Storage",    "claude"),
         ("Electron Safe Storage",  "Claude"),
     ]
@@ -56,7 +57,7 @@ def _keychain_password() -> Optional[bytes]:
         try:
             r = subprocess.run(
                 ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=15,
             )
             if r.returncode == 0 and r.stdout.strip():
                 return r.stdout.strip().encode()
@@ -105,9 +106,11 @@ def _parse_token_cache(raw) -> Optional[dict]:
     now_ms = time.time() * 1000
     cache  = json.loads(raw) if isinstance(raw, str) else raw
 
+    if not isinstance(cache, dict):
+        return None
     # Prefer a token scoped for claude_code
     for key, val in cache.items():
-        if (CLIENT_ID in key and "sessions:claude_code" in key
+        if ("sessions:claude_code" in key
                 and isinstance(val, dict) and val.get("expiresAt", 0) > now_ms):
             return {"accessToken": val["token"],
                     "refreshToken": val.get("refreshToken"),
@@ -148,74 +151,14 @@ def _load_from_desktop() -> Optional[dict]:
     except Exception:
         return None
 
-    if tokens:
-        _save_tokens(tokens)
     return tokens
 
 
-def _save_tokens(tokens: dict) -> None:
-    TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_CACHE.write_text(json.dumps(tokens))
-
-
-def _load_cached() -> Optional[dict]:
-    try:
-        if TOKEN_CACHE.exists():
-            return json.loads(TOKEN_CACHE.read_text())
-    except Exception:
-        pass
-    return None
-
-
-# ── OAuth token refresh ────────────────────────────────────────────────────────
-
-def _refresh_access_token(refresh_tok: str) -> dict:
-    body = json.dumps({
-        "grant_type":    "refresh_token",
-        "refresh_token": refresh_tok,
-        "client_id":     CLIENT_ID,
-        "scope":         SCOPES,
-    }).encode()
-    req = urllib.request.Request(
-        "https://platform.claude.com/v1/oauth/token",
-        data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "claude-code/1.0.34"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=15) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Token refresh failed: {e.code}")
-    return {
-        "accessToken":  data["access_token"],
-        "refreshToken": data["refresh_token"],
-        "expiresAt":    int(time.time() * 1000) + data["expires_in"] * 1000,
-    }
-
-
 def get_valid_token() -> str:
-    """Return a valid Bearer token, loading and refreshing as needed."""
-    tokens = _load_cached() or _load_from_desktop()
+    """Use only the Desktop app's currently valid token; never persist it."""
+    tokens = _load_from_desktop()
     if not tokens:
-        raise RuntimeError(
-            "No OAuth tokens found — open Claude desktop app and make sure you're logged in"
-        )
-
-    nearly_expired = tokens.get("expiresAt", 0) <= time.time() * 1000 + 60_000
-    if nearly_expired:
-        if tokens.get("refreshToken"):
-            try:
-                tokens = _refresh_access_token(tokens["refreshToken"])
-                _save_tokens(tokens)
-                return tokens["accessToken"]
-            except Exception:
-                # Refresh token stale; re-read from desktop app
-                fresh = _load_from_desktop()
-                if fresh and fresh.get("expiresAt", 0) > time.time() * 1000 + 60_000:
-                    return fresh["accessToken"]
-        raise RuntimeError("Token expired and could not be refreshed")
-
+        raise RuntimeError("Exact reset unavailable; sign in to Claude Desktop and allow Keychain access")
     return tokens["accessToken"]
 
 
@@ -248,77 +191,61 @@ def fetch_rate_limits() -> dict:
         raise RuntimeError(f"API error {e.code}: {e.read().decode()[:200]}")
 
     def hf(name): return h.get(name)
+    if hf("anthropic-ratelimit-unified-5h-utilization") is None:
+        raise RuntimeError("Exact reset unavailable: rate-limit headers missing")
 
     return {
         "ok":       True,
-        "pct_5h":   float(hf("anthropic-ratelimit-unified-5h-utilization") or 0),
+        "pct_5h":   float(hf("anthropic-ratelimit-unified-5h-utilization")),
         "reset_5h": int(hf("anthropic-ratelimit-unified-5h-reset") or 0),
-        "pct_7d":   float(hf("anthropic-ratelimit-unified-7d-utilization") or 0),
+        "pct_7d":   float(hf("anthropic-ratelimit-unified-7d-utilization")) if hf("anthropic-ratelimit-unified-7d-utilization") is not None else None,
         "reset_7d": int(hf("anthropic-ratelimit-unified-7d-reset") or 0),
     }
 
 
-# ── JSONL token scanning ───────────────────────────────────────────────────────
+def parse_usage_history(raw: bytes, now: Optional[float] = None) -> dict:
+    """Read Claude's undocumented, read-only usage history (percentages 0..100)."""
+    now = time.time() if now is None else now
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or payload.get("version") != 2:
+        raise ValueError("Unsupported Claude usage-history format")
+    samples = payload.get("samples", [])
+    if not isinstance(samples, list):
+        raise ValueError("Unsupported Claude usage-history format")
+    valid = [s for s in samples if isinstance(s, dict) and
+             isinstance(s.get("t"), (int, float)) and isinstance(s.get("u"), dict) and
+             all(isinstance(s["u"].get(k), (int, float)) and 0 <= s["u"][k] <= 100
+                 for k in ("fh", "sd"))]
+    if not valid:
+        raise ValueError("No Claude usage samples found")
+    latest = max(valid, key=lambda s: s["t"])
+    sampled_at = latest["t"] / 1000
+    if sampled_at > now + 300 or now - sampled_at > STALE_AFTER:
+        raise ValueError("Claude usage history is out of date")
+    # Percentages are already whole percentages; API utilization is a fraction.
+    same_org = sorted((s for s in valid if s.get("org") == latest.get("org") and
+                       s["t"] <= latest["t"]), key=lambda s: s["t"], reverse=True)
+    reset = 0
+    if latest["u"]["fh"] > 0:
+        start = same_org[0]["t"]
+        for sample in same_org[1:]:
+            if sample["u"]["fh"] == 0 or start - sample["t"] > 5 * 3600 * 1000:
+                break
+            start = sample["t"]
+        estimated = int(start / 1000 + 5 * 3600)
+        if estimated > now:
+            reset = estimated
+    return {"pct_5h": latest["u"]["fh"] / 100,
+            "pct_7d": latest["u"]["sd"] / 100,
+            "reset_5h": reset, "reset_7d": 0,
+            "sampled_at": sampled_at, "source": "local"}
 
-def scan_jsonl_tokens() -> tuple:
-    """Scan ~/.claude/projects JSONL files. Returns (tokens_5h, tokens_7d)."""
-    now    = datetime.now(timezone.utc)
-    cut_5h = now - timedelta(hours=5)
-    cut_7d = now - timedelta(days=7)
-    used_5h = used_7d = 0
-    seen: set = set()
 
-    for jsonl in PROJECTS_DIR.rglob("*.jsonl"):
-        try:
-            with open(jsonl, encoding="utf-8", errors="replace") as f:
-                for raw in f:
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        entry = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    if entry.get("type") != "assistant":
-                        continue
-                    ts_str = entry.get("timestamp", "")
-                    if not ts_str:
-                        continue
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-                    in_5h = ts >= cut_5h
-                    in_7d = ts >= cut_7d
-                    if not (in_5h or in_7d):
-                        continue
-                    req_id = entry.get("requestId")
-                    if req_id:
-                        if req_id in seen:
-                            continue
-                        seen.add(req_id)
-                    usage = entry.get("message", {}).get("usage", {})
-                    toks  = (usage.get("input_tokens", 0)
-                             + usage.get("cache_creation_input_tokens", 0))
-                    if in_5h:
-                        used_5h += toks
-                    if in_7d:
-                        used_7d += toks
-        except Exception:
-            pass
-
-    return used_5h, used_7d
+def load_local_usage() -> dict:
+    return parse_usage_history(HISTORY_FILE.read_bytes())
 
 
 # ── Formatting helpers ─────────────────────────────────────────────────────────
-
-def fmt_tokens(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
-
 
 def fmt_delta(td: timedelta) -> str:
     if td.total_seconds() <= 0:
@@ -337,158 +264,156 @@ def fmt_delta(td: timedelta) -> str:
 class ClaudeMonitorApp(rumps.App):
 
     def __init__(self):
-        super().__init__("Claude", quit_button=None)
-
+        super().__init__("Claude Usage", quit_button=None)
         self._api_data: Optional[dict] = None
-        self._api_fetched_at: float    = 0.0
-        self._jsonl_5h: int            = 0
-        self._jsonl_7d: int            = 0
-        self._jsonl_fetched_at: float  = 0.0
-        self._show_timer: bool         = True
+        self._api_fetched_at = 0.0
+        self._local_data: Optional[dict] = None
+        self._local_checked_at = 0.0
+        self._show_timer = True
         self._last_error: Optional[str] = None
         self._lock = threading.Lock()
-
-        self._item_5h      = rumps.MenuItem("5h window:  —")
-        self._item_7d      = rumps.MenuItem("7d window:  —")
+        self._refreshing = False
+        self._item_5h = rumps.MenuItem("5h: —")
+        self._item_7d = rumps.MenuItem("7d: —")
         self._item_updated = rumps.MenuItem("Loading…")
-        self._item_toggle  = rumps.MenuItem(
-            "Show timer in menu bar", callback=self._on_toggle_timer
-        )
+        self._item_toggle = rumps.MenuItem("Show timer in menu bar", callback=self._on_toggle_timer)
         self._item_toggle.state = True
+        self._item_login = rumps.MenuItem("Launch at login", callback=self._on_toggle_login)
+        self._item_login.state = LOGIN_AGENT.exists()
+        self._item_settings = rumps.MenuItem("Open Claude usage settings", callback=lambda _: webbrowser.open("https://claude.ai/settings/usage"))
         self._item_refresh = rumps.MenuItem("Refresh now", callback=self._on_refresh)
-        self._item_quit    = rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application())
-
+        self._item_quit = rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application())
         self.menu = [
-            self._item_5h,
-            self._item_7d,
-            None,
-            self._item_updated,
-            None,
-            self._item_toggle,
-            self._item_refresh,
-            None,
-            self._item_quit,
+            self._item_5h, self._item_7d, None, self._item_updated, None,
+            self._item_toggle, self._item_login, self._item_settings,
+            self._item_refresh, None, self._item_quit,
         ]
-
-        # Fetch data on startup (background so the app opens immediately)
-        threading.Thread(target=self._do_refresh, daemon=True).start()
-
-        # Poll for new data every 2 minutes
-        self._data_poll = rumps.Timer(self._on_data_tick, 120)
+        self._start_refresh()
+        self._data_poll = rumps.Timer(self._on_data_tick, 60)
         self._data_poll.start()
-
-        # Redraw the countdown in the menu bar every 30 seconds (no network call)
         self._countdown_tick = rumps.Timer(self._on_countdown_tick, 30)
         self._countdown_tick.start()
 
-    # ── Timer callbacks (main thread) ──────────────────────────────────────────
-
     def _on_data_tick(self, _sender):
-        threading.Thread(target=self._do_refresh, daemon=True).start()
+        self._start_refresh()
 
     def _on_countdown_tick(self, _sender):
-        """Re-render the title from cached data — no network needed."""
         self._redraw()
 
     def _on_refresh(self, _sender):
-        """Force a full API re-fetch when the user clicks Refresh now."""
         with self._lock:
             self._api_fetched_at = 0.0
-        threading.Thread(target=self._do_refresh, daemon=True).start()
+            self._local_checked_at = 0.0
+        self._start_refresh()
 
     def _on_toggle_timer(self, sender):
         self._show_timer = not self._show_timer
         sender.state = self._show_timer
         self._redraw()
 
-    # ── Background worker ──────────────────────────────────────────────────────
+    def _on_toggle_login(self, sender):
+        try:
+            if LOGIN_AGENT.exists():
+                LOGIN_AGENT.unlink()
+                sender.state = False
+            else:
+                from AppKit import NSBundle
+                bundle = str(NSBundle.mainBundle().bundlePath())
+                if not bundle.endswith(".app"):
+                    raise ValueError("Launch at login requires the installed app")
+                LOGIN_AGENT.parent.mkdir(parents=True, exist_ok=True)
+                agent = {"Label": "com.internal.claude-usage-monitor",
+                         "ProgramArguments": ["/usr/bin/open", "-a", bundle],
+                         "RunAtLoad": True}
+                LOGIN_AGENT.write_bytes(plistlib.dumps(agent))
+                sender.state = True
+        except Exception as exc:
+            rumps.alert("Launch at login", str(exc))
+
+    def _start_refresh(self):
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+        threading.Thread(target=self._do_refresh, daemon=True).start()
 
     def _do_refresh(self):
-        now = time.time()
-
-        with self._lock:
-            needs_api   = now - self._api_fetched_at   > API_TTL
-            needs_jsonl = now - self._jsonl_fetched_at > JSONL_TTL
-
-        if needs_api:
-            try:
-                data = fetch_rate_limits()
+        try:
+            now = time.time()
+            with self._lock:
+                needs_api = now - self._api_fetched_at >= API_TTL
+                needs_local = now - self._local_checked_at >= HISTORY_TTL
+            if needs_local:
+                try:
+                    data = load_local_usage()
+                    with self._lock:
+                        self._local_data = data
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    with self._lock:
+                        self._local_data = None
+                        self._last_error = f"Local usage unavailable: {exc}"
                 with self._lock:
-                    self._api_data      = data
-                    self._api_fetched_at = time.time()
-                    self._last_error     = None
-            except Exception as exc:
-                with self._lock:
-                    self._last_error = str(exc)
-
-        if needs_jsonl:
-            try:
-                h5, h7 = scan_jsonl_tokens()
-                with self._lock:
-                    self._jsonl_5h       = h5
-                    self._jsonl_7d       = h7
-                    self._jsonl_fetched_at = time.time()
-            except Exception:
-                pass
-
-        self._redraw()
-
-    # ── UI renderer (safe to call from any thread via rumps internals) ─────────
+                    self._local_checked_at = time.time()
+                AppHelper.callAfter(self._redraw)
+            if needs_api:
+                try:
+                    data = fetch_rate_limits()
+                    with self._lock:
+                        self._api_data = data
+                        self._api_fetched_at = time.time()
+                        self._last_error = None
+                except Exception as exc:
+                    with self._lock:
+                        self._api_data = None
+                        self._api_fetched_at = time.time()
+                        self._last_error = str(exc)
+            AppHelper.callAfter(self._redraw)
+        finally:
+            with self._lock:
+                self._refreshing = False
 
     def _redraw(self):
         with self._lock:
-            api      = self._api_data
-            h5_raw   = self._jsonl_5h
-            h7_raw   = self._jsonl_7d
-            error    = self._last_error
-
-        # ── Error state ────────────────────────────────────────────────────────
-        if error and api is None:
+            api = self._api_data if time.time() - self._api_fetched_at < API_TTL + 60 else None
+            local = self._local_data
+            error = self._last_error
+        data = api or local
+        if data is None:
             self.title = "⚠ Claude"
-            self._item_5h.title      = f"Error: {error[:72]}"
-            self._item_7d.title      = "Make sure Claude desktop app is running"
-            self._item_updated.title = f"Failed: {datetime.now().strftime('%H:%M:%S')}"
+            self._item_5h.title = "5h: —"
+            self._item_7d.title = "7d: —"
+            self._item_updated.title = (error or "Open Claude Desktop to see usage")[:110]
             return
-
         now_utc = datetime.now(timezone.utc)
-
-        # ── Window rows ────────────────────────────────────────────────────────
-        def window_line(label, raw_tokens, pct_key, reset_key):
-            pct_f    = (api or {}).get(pct_key)
-            reset_ts = (api or {}).get(reset_key)
-            pct_str  = f"{round(pct_f * 100)}%" if pct_f is not None else "?%"
-            tok_str  = fmt_tokens(raw_tokens)
-            if reset_ts:
-                reset_dt    = datetime.fromtimestamp(reset_ts, tz=timezone.utc)
-                delta_str   = fmt_delta(reset_dt - now_utc)
-                clock_str   = reset_dt.astimezone().strftime("%H:%M")
-                timing = f"resets in {delta_str}  ({clock_str})"
-            else:
-                timing = "reset time unknown"
-            return f"{label}   {pct_str}  ({tok_str})   →  {timing}"
-
-        self._item_5h.title      = window_line("5h:", h5_raw, "pct_5h", "reset_5h")
-        self._item_7d.title      = window_line("7d:", h7_raw, "pct_7d", "reset_7d")
-        self._item_updated.title = f"Updated: {datetime.now().strftime('%H:%M:%S')}"
-
-        # ── Menu bar title ─────────────────────────────────────────────────────
-        if api is None:
-            self.title = "◉ —"
-            return
-
-        pct_5h   = api.get("pct_5h", 0)
-        reset_5h = api.get("reset_5h")
-        pct_str  = f"{round(pct_5h * 100)}%"
-
-        if self._show_timer and reset_5h:
-            reset_dt  = datetime.fromtimestamp(reset_5h, tz=timezone.utc)
-            timer_str = fmt_delta(reset_dt - now_utc)
-            self.title = f"◉ {pct_str} | {timer_str}"
+        def window_line(label, pct_key, reset_key):
+            pct = data.get(pct_key)
+            pct_str = f"{round(pct * 100)}%" if pct is not None else "—"
+            reset = data.get(reset_key)
+            timing = "reset time unavailable"
+            if reset and reset > time.time():
+                date = datetime.fromtimestamp(reset, tz=timezone.utc)
+                prefix = "estimated reset" if data is local else "resets"
+                timing = f"{prefix} in {fmt_delta(date - now_utc)} ({date.astimezone():%H:%M})"
+            return f"{label}: {pct_str}  ·  {timing}"
+        self._item_5h.title = window_line("5h", "pct_5h", "reset_5h")
+        self._item_7d.title = window_line("7d", "pct_7d", "reset_7d")
+        if api:
+            self._item_updated.title = f"Server data · updated {datetime.fromtimestamp(self._api_fetched_at):%H:%M}"
         else:
-            self.title = f"◉ {pct_str}"
+            self._item_updated.title = f"Local data · sampled {datetime.fromtimestamp(local['sampled_at']):%H:%M} · exact reset unavailable"
+        reset = data.get("reset_5h")
+        suffix = ""
+        if self._show_timer and reset and reset > time.time():
+            suffix = f" | {'~' if data is local else ''}{fmt_delta(datetime.fromtimestamp(reset, tz=timezone.utc) - now_utc)}"
+        self.title = f"◉ {round(data['pct_5h'] * 100)}%{suffix}"
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    ClaudeMonitorApp().run()
+    if "--smoke-check" in sys.argv:
+        from AppKit import NSBundle, NSStatusBar
+        assert NSBundle.mainBundle().bundleIdentifier() == "com.internal.claude-usage-monitor"
+        assert NSStatusBar.systemStatusBar() is not None
+    else:
+        ClaudeMonitorApp().run()

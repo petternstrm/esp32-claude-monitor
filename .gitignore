@@ -12,6 +12,8 @@ proxy_err.txt
 
 # ─── Arduino build artefacts ─────────────────────────────────────────────────
 build/
+dist/
+venv/
 *.elf
 *.bin
 *.map

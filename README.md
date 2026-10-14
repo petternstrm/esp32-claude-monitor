@@ -1,6 +1,6 @@
 # Claude Usage Monitor
 
-A real-time Claude API usage monitor that shows your **5-hour** and **weekly** token usage — percentage used, reset timer, and raw token count — fetched directly from Anthropic's servers using your Claude desktop app's OAuth token. No API key required.
+A Claude plan usage monitor for the **5-hour** and **weekly** limits. The macOS menu-bar app prefers server-provided percentages and reset times, with a read-only Claude Desktop usage-history fallback.
 
 Two display options:
 
@@ -8,96 +8,58 @@ Two display options:
 |---|---|---|
 | **Platform** | macOS | Windows (proxy) + any WiFi |
 | **Hardware** | None | ESP32-2432S028R (~$10) |
-| **Dependencies** | Python + 2 packages | Python + Node.js + Arduino |
-| **Setup time** | ~2 minutes | ~30 minutes |
+| **Dependencies** | None for end users | Python + Node.js + Arduino |
+| **Setup time** | Drag into Applications | ~30 minutes |
 
 ---
 
 ## How It Works
 
-**macOS app** — a single Python process reads tokens from the Claude desktop app via macOS Keychain, calls the Anthropic API directly, and displays results in the menu bar.
+**macOS app** — a bundled menu-bar app reads plan usage locally from Claude Desktop and optionally accesses the current Claude Desktop session via macOS Keychain for exact server-provided reset times. It does not store OAuth credentials or refresh tokens. The exact-data request sends a minimal Claude message about every five minutes and uses a small amount of your plan allowance.
 
 **ESP32 setup** — a Windows proxy server decrypts the OAuth token (Windows DPAPI), serves data over HTTP on port 5000, and the ESP32 polls it over WiFi every 2 minutes.
 
-Both options use the same approach: one minimal `claude-haiku` call every 5 minutes (~8 tokens) to read the `anthropic-ratelimit-unified-*` response headers, plus a scan of `~/.claude/projects/**/*.jsonl` for raw token counts.
+The ESP32 proxy uses its own token and JSONL scanning implementation; its installation instructions are below.
 
 ---
 
 ## macOS Menu Bar App
 
-### Prerequisites
+### Install (Apple Silicon)
 
-- macOS with Claude desktop app installed and logged in
-- Python 3.9+
-- `pip install rumps cryptography`
+1. Install and sign in to Claude Desktop.
+2. Download `Claude-Usage-arm64.dmg`, open it, and drag **Claude Usage.app** to **Applications**.
+3. Open **Claude Usage** from Applications. Its percentage appears in the menu bar; click it for both limits and the reset times.
+4. If macOS blocks the unnotarized download, try opening the app once, then open **System Settings → Privacy & Security → Open Anyway**. Confirm **Open**. This is a one-time graphical step; no Terminal is required.
+5. If asked for access to **Claude Safe Storage** in Keychain, allow it to enable exact reset times. If you decline, the app uses Claude Desktop's local usage percentages, and labels any reset estimate.
 
-### Setup
-
-```bash
-git clone https://github.com/yourname/esp32-claude-monitor.git
-cd esp32-claude-monitor
-pip install -r requirements_mac.txt
-python claude_monitor_mac.py
-```
-
-The app appears in your menu bar immediately. On first run it reads the OAuth token from `~/Library/Application Support/Claude/config.json`, decrypts it using your Keychain, and caches it to `~/.claude/proxy_oauth_token.json` for subsequent launches.
+Select **Launch at login** from the menu after installing to Applications. To uninstall, quit the app, turn off Launch at login if enabled, and move the app to Trash. The app does not copy credentials into its bundle or a local cache.
 
 ### Menu bar
 
 ```
-◉ 72% | 4h 23m                   ← 5h usage + reset countdown (toggleable)
+◉ 72% | 4h 23m                   ← 5h plan usage + reset countdown
 ────────────────────────────────
-5h:   72%  (124.5K)  →  resets in 4h 23m  (18:45)
-7d:   45%  (2.1M)    →  resets in 2d 14h  (Fri 09:00)
+5h: 72% · resets in 4h 23m (18:45)
+7d: 45% · resets in 2d 14h (09:00)
 ────────────────────────────────
-Updated: 14:23:05
+Server data · updated 14:23
 ────────────────────────────────
-✓ Show timer in menu bar
+✓ Show timer in menu bar · Launch at login
+Open Claude usage settings
 Refresh now
 ────────────────────────────────
 Quit
 ```
 
 - The menu bar title updates every 30 seconds with a fresh countdown
-- Data is re-fetched from the API every 5 minutes (background thread)
+- Local data is checked every minute; server data is requested at most once every 5 minutes
 - **Show timer in menu bar** toggles the reset countdown on/off
+- Local percentages are read from `~/Library/Application Support/Claude/plan-usage-history.json`; stale samples are not displayed. Local reset estimates are labelled `estimated` or prefixed `~`.
 
-### Auto-start at login (optional)
+### Build a new macOS release (maintainers)
 
-Create a launchd plist at `~/Library/LaunchAgents/com.claude.monitor.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>       <string>com.claude.monitor</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/python3</string>
-    <string>/path/to/esp32-claude-monitor/claude_monitor_mac.py</string>
-  </array>
-  <key>RunAtLoad</key>   <true/>
-  <key>KeepAlive</key>   <true/>
-</dict>
-</plist>
-```
-
-Replace `/path/to/` with the actual repo path, then load it:
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.claude.monitor.plist
-```
-
-### Troubleshooting (macOS)
-
-| Symptom | Fix |
-|---|---|
-| `⚠ Claude` in menu bar | Claude desktop app not running or not logged in |
-| No Keychain prompt / `Error: No OAuth tokens` | Open Claude desktop app and sign in, then retry |
-| Keychain access denied | Run `python claude_monitor_mac.py` from Terminal once to grant access manually |
-| `ModuleNotFoundError: rumps` | `pip install rumps cryptography` |
+On an Apple Silicon Mac, create a Python environment, install `requirements_mac.txt` and PyInstaller, then run `bash build_mac.sh`. The output is `dist/Claude Usage.app` and `dist/Claude-Usage-arm64.dmg`. Test the DMG after downloading it on another Mac, as a locally built copy may not carry the downloaded-file quarantine flag. This build was produced on macOS 26; validate compatibility on older macOS versions separately. This release is ad-hoc signed, not notarized; the user must approve first launch in macOS settings.
 
 ---
 
