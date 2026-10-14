@@ -1,215 +1,36 @@
-# Claude Usage Monitor
+# Claude Usage Monitor for macOS
 
-A Claude plan usage monitor for the **5-hour** and **weekly** limits. The macOS menu-bar app prefers server-provided percentages and reset times, with a read-only Claude Desktop usage-history fallback.
+A small Apple Silicon menu-bar app showing how much of your Claude plan's **five-hour** and **weekly** limits you have used, and when they reset. Usage is shared across Claude Desktop, claude.ai, and Claude Code when they use the same subscription account. API-key-billed usage is separate. The percentages describe plan usage, not raw token counts.
 
-Two display options:
+## Install
 
-| | macOS menu bar app | ESP32 CYD display |
-|---|---|---|
-| **Platform** | macOS | Windows (proxy) + any WiFi |
-| **Hardware** | None | ESP32-2432S028R (~$10) |
-| **Dependencies** | None for end users | Python + Node.js + Arduino |
-| **Setup time** | Drag into Applications | ~30 minutes |
+1. Install Claude Desktop and sign in to your subscription account.
+2. [Download the latest Apple Silicon DMG](https://github.com/petternstrm/esp32-claude-monitor/releases/latest), open it, and drag **Claude Usage.app** into **Applications**.
+3. Open **Claude Usage** from Applications, then click its menu-bar percentage to see both limits. **Launch at login** is available in the menu.
 
----
+The internal release is ad-hoc signed but not notarized. If macOS blocks the downloaded app, try opening it once, then go to **System Settings → Privacy & Security → Open Anyway** and confirm. This one-time step does not require Terminal. Installation instructions are also inside the DMG.
 
-## How It Works
+For exact server-provided percentages and reset times, allow macOS Keychain access to **Claude Safe Storage** when asked. If access or the server request is unavailable, the app uses fresh local usage data from Claude Desktop and marks any reset estimate with `~` or `estimated`. It does not store a separate copy of your OAuth credentials. A manual **Refresh now** also attempts a server request and may trigger a Keychain prompt.
 
-**macOS app** — a bundled menu-bar app reads plan usage locally from Claude Desktop and optionally accesses the current Claude Desktop session via macOS Keychain for exact server-provided reset times. It does not store OAuth credentials or refresh tokens. The exact-data request sends a minimal Claude message about every five minutes and uses a small amount of your plan allowance.
+## How it refreshes
 
-**ESP32 setup** — a Windows proxy server decrypts the OAuth token (Windows DPAPI), serves data over HTTP on port 5000, and the ESP32 polls it over WiFi every 2 minutes.
+- Checks Claude Desktop's local usage history every minute; samples older than 30 minutes are not displayed.
+- Requests server-provided usage and reset times about every five minutes by sending a minimal Claude message. This uses a small amount of your plan allowance.
+- Updates the menu-bar countdown every 30 seconds without another server request.
+- **Refresh now** checks both sources immediately.
 
-The ESP32 proxy uses its own token and JSONL scanning implementation; its installation instructions are below.
+Local usage is read from `~/Library/Application Support/Claude/plan-usage-history.json`. That file belongs to Claude Desktop and its format may change. Local percentages reflect the last time Desktop updated the file, so activity in Claude Code or the web may appear there with a delay.
 
----
+To uninstall, quit the app, turn off **Launch at login** if enabled, and move **Claude Usage.app** to Trash.
 
-## macOS Menu Bar App
+## Build from source
 
-### Install (Apple Silicon)
-
-1. Install and sign in to Claude Desktop.
-2. Download `Claude-Usage-arm64.dmg`, open it, and drag **Claude Usage.app** to **Applications**.
-3. Open **Claude Usage** from Applications. Its percentage appears in the menu bar; click it for both limits and the reset times.
-4. If macOS blocks the unnotarized download, try opening the app once, then open **System Settings → Privacy & Security → Open Anyway**. Confirm **Open**. This is a one-time graphical step; no Terminal is required.
-5. If asked for access to **Claude Safe Storage** in Keychain, allow it to enable exact reset times. If you decline, the app uses Claude Desktop's local usage percentages, and labels any reset estimate.
-
-Select **Launch at login** from the menu after installing to Applications. To uninstall, quit the app, turn off Launch at login if enabled, and move the app to Trash. The app does not copy credentials into its bundle or a local cache.
-
-### Menu bar
-
-```
-◉ 72% | 4h 23m                   ← 5h plan usage + reset countdown
-────────────────────────────────
-5h: 72% · resets in 4h 23m (18:45)
-7d: 45% · resets in 2d 14h (09:00)
-────────────────────────────────
-Server data · updated 14:23
-────────────────────────────────
-✓ Show timer in menu bar · Launch at login
-Open Claude usage settings
-Refresh now
-────────────────────────────────
-Quit
-```
-
-- The menu bar title updates every 30 seconds with a fresh countdown
-- Local data is checked every minute; server data is requested at most once every 5 minutes
-- **Show timer in menu bar** toggles the reset countdown on/off
-- Local percentages are read from `~/Library/Application Support/Claude/plan-usage-history.json`; stale samples are not displayed. Local reset estimates are labelled `estimated` or prefixed `~`.
-
-### Build a new macOS release (maintainers)
-
-On an Apple Silicon Mac, create a Python environment, install `requirements_mac.txt` and PyInstaller, then run `bash build_mac.sh`. The output is `dist/Claude Usage.app` and `dist/Claude-Usage-arm64.dmg`. Test the DMG after downloading it on another Mac, as a locally built copy may not carry the downloaded-file quarantine flag. This build was produced on macOS 26; validate compatibility on older macOS versions separately. This release is ad-hoc signed, not notarized; the user must approve first launch in macOS settings.
-
----
-
-## ESP32 CYD Display (Windows)
-
-### How It Works
-
-```
-Anthropic API
-     ↑  (minimal haiku call, ~8 tokens, every 5 min)
-rate_limit_fetcher.js   ← decrypts OAuth token from Claude desktop app (Windows DPAPI)
-     ↑
-proxy_server.py         ← Flask server on port 5000, also scans JSONL for raw counts
-     ↑  (HTTP, every 2 min)
-ESP32 CYD               ← displays bars, percentages, reset times
-```
-
-### Hardware
-
-| Part | Details |
-|---|---|
-| Board | ESP32-2432S028R ("Cheap Yellow Display" / CYD) |
-| Display | 2.4" ILI9341 TFT, 240×320 |
-| Touch | XPT2046 resistive |
-| Interface | USB micro-B (for flashing), WiFi (2.4 GHz only) |
-
-Search AliExpress/Amazon for **"ESP32 Cheap Yellow Display"** or **"ESP32-2432S028R"**.
-
-### Prerequisites
-
-- **Windows** (OAuth token decryption uses Windows DPAPI via PowerShell)
-- **Claude desktop app** installed and logged in
-- **Node.js** — https://nodejs.org (install to default path `C:\Program Files\nodejs\`)
-- **Python 3.9+** with Flask: `pip install flask`
-- **Arduino IDE 2** or **arduino-cli**, with:
-  - ESP32 board core `esp32:esp32` (board manager URL: `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`)
-  - Libraries: **TFT_eSPI** by Bodmer, **ArduinoJson** by Benoit Blanchon
-
-### Setup
-
-#### 1. Clone the repo
+Build on an Apple Silicon Mac with Python 3 and macOS command-line tools:
 
 ```bash
-git clone https://github.com/yourname/esp32-claude-monitor.git
-cd esp32-claude-monitor
+python3 -m venv venv
+venv/bin/python -m pip install -r requirements_mac.txt 'pyinstaller>=6.15,<7'
+bash build_mac.sh
 ```
 
-#### 2. Start the proxy server
-
-```bash
-pip install flask
-python proxy_server.py
-```
-
-Verify — open http://localhost:5000/usage in your browser. You should see JSON with `"api_synced": true`.
-
-> The Claude desktop app must be running and logged in on first use.
-
-#### Auto-start at Windows login (optional)
-
-1. Edit `start_proxy.vbs` — fill in your Python path and the path to `proxy_server.py`
-2. Find your Python path: `where python` in cmd
-3. Copy `start_proxy.vbs` to `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`
-
-#### 3. Configure the ESP32 sketch
-
-```bash
-cp esp32_claude_monitor/config.h.example esp32_claude_monitor/config.h
-```
-
-Edit `esp32_claude_monitor/config.h`:
-
-```cpp
-#define WIFI_SSID   "Your_WiFi_Name"   // 2.4 GHz only
-#define WIFI_PASS   "your_wifi_password"
-#define SERVER_HOST "192.168.1.X"      // your PC's local IP (ipconfig | findstr IPv4)
-```
-
-> `config.h` is gitignored — your credentials will never be committed.
-
-#### 4. Configure TFT_eSPI
-
-In your Arduino libraries folder, edit `TFT_eSPI/User_Setup.h`:
-
-```cpp
-#define ILI9341_2_DRIVER       // NOT ILI9341_DRIVER
-#define TFT_MOSI  13
-#define TFT_SCLK  14
-#define TFT_MISO  12
-#define TFT_CS    15
-#define TFT_DC     2
-#define TFT_BL    27           // backlight — NOT pin 21
-#define TFT_INVERSION_ON
-#define ESP32_DMA
-#define SPI_FREQUENCY  65000000
-#define TOUCH_CS  33
-```
-
-#### 5. Flash the ESP32
-
-**Arduino IDE:** Open `esp32_claude_monitor/esp32_claude_monitor.ino`, select board **ESP32 Dev Module**, select the correct COM port, click Upload.
-
-**arduino-cli:**
-```bash
-arduino-cli compile --fqbn esp32:esp32:esp32 esp32_claude_monitor
-arduino-cli upload  --fqbn esp32:esp32:esp32 --port COM7 esp32_claude_monitor
-```
-
-### Display Layout
-
-```
-┌─────────────────────────┐
-│     CLAUDE MONITOR      │
-├─────────────────────────┤
-│ 5H WINDOW               │
-│ Resets: 14:30  (2h 15m) │
-│ [████████░░░░░░░░] 48%  │
-│ 183.9K tokens           │
-├─────────────────────────┤
-│ WEEKLY                  │
-│ Resets: Tue 20:00 (4d)  │
-│ [███░░░░░░░░░░░░░] 17%  │
-│ 2.16M tokens            │
-├─────────────────────────┤
-│ Updated: 14:22:05       │
-│      [ REFRESH ]        │
-└─────────────────────────┘
-```
-
-- Bar turns **yellow** at 70%, **red** at 90%
-- Tap **REFRESH** to fetch immediately
-
-### Troubleshooting (ESP32)
-
-| Symptom | Fix |
-|---|---|
-| ESP32 shows "Error: No connection" | Check `SERVER_HOST` in `config.h` matches your PC's current IP (`ipconfig`) |
-| `api_synced: false` in `/usage` | Claude desktop app not running, or Node.js not found at `C:\Program Files\nodejs\node.exe` |
-| COM port not appearing | USB cable is charge-only — use a data cable |
-| Multiple proxy instances | Kill all `python` processes on port 5000 and restart |
-| Token refresh errors | Restart Claude desktop app to refresh its session |
-
----
-
-## Cost
-
-Each rate limit fetch makes one minimal API call (`claude-haiku`, `max_tokens: 1`, single `.` message) costing roughly **8 input tokens**. With the default 5-minute cache, that's ~2304 tokens/day — negligible.
-
----
-
-## License
-
-MIT
+The build produces `dist/Claude Usage.app` and `dist/Claude-Usage-arm64.dmg`. Run the parser tests with `venv/bin/python -m unittest -v test_claude_usage`. The published v1.0.0 build was produced on macOS 26; compatibility with older macOS versions has not been validated.

@@ -1,26 +1,13 @@
-# ─── Sensitive config (contains WiFi credentials) ────────────────────────────
-esp32_claude_monitor/config.h
-
-# ─── Python ──────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.pyc
 *.pyo
+venv/
 
-# ─── Proxy runtime logs ───────────────────────────────────────────────────────
-proxy_out.txt
-proxy_err.txt
-
-# ─── Arduino build artefacts ─────────────────────────────────────────────────
+# macOS build artifacts
 build/
 dist/
-venv/
-*.elf
-*.bin
-*.map
 
-# ─── OS ──────────────────────────────────────────────────────────────────────
+# OS
 .DS_Store
 Thumbs.db
-
-# ─── Cached OAuth token (written by rate_limit_fetcher.js) ───────────────────
-# Lives in ~/.claude/proxy_oauth_token.json — not in this repo, just a reminder
